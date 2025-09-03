@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# ovlshell.sh — private workspace from git root or $PWD.
+# Linux: fuse-overlayfs (or kernel overlay). macOS: APFS clone (cp -c -R).
+set -Eeuo pipefail
+
+die(){ echo "Error: $*" >&2; exit 1; }
+
+abspath(){ (cd "$1" 2>/dev/null && pwd -P) || { local d="$(dirname "$1")"; local b="$(basename "$1")"; (cd "$d" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$b"); }; }
+
+pick_seed(){
+  if r="$(git rev-parse --show-toplevel 2>/dev/null)"; then printf '%s\n' "$r"; else printf '%s\n' "$PWD"; fi
+}
+
+gen_name(){
+  local -a ADJ=(admiring adoring brave clever focused gifted goofy happy hopeful keen lucid mystic nifty nimble quirky serene sharp stoic sunny zealous)
+  local -a N=(archimedes bohr curie darwin euclid fermi gauss hamilton kepler lovelace maxwell newton pascal riemann turing volta wright)
+  printf '%s_%s\n' "${ADJ[$RANDOM%${#ADJ[@]}]}" "${N[$RANDOM%${#N[@]}]}"
+}
+
+usage(){
+  cat <<EOF
+Usage: $0 [-n name] [-c "command"]
+  -n name     Optional session name (default: docker-style random)
+  -c command  Run non-interactive command in the workspace then exit
+Behavior:
+  * Seed = git repo root if inside a repo, else current directory
+  * Creates a private workspace under \$TMPDIR (or /tmp)
+  * Linux: overlay COW; macOS: APFS clone
+  * Launches your shell from \$SHELL (fallback: /bin/bash, then /bin/sh)
+EOF
+}
+
+NAME=""; CMD=""
+while [[ $# -gt 0 ]]; do
+  case "${1:-}" in
+    -n) NAME="${2:-}"; shift 2 ;;
+    -c) CMD="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown arg: $1 (use -h)" ;;
+  esac
+done
+
+OS="$(uname -s)"
+ORIG_PWD="$(pwd -P)"
+SEED="$(pick_seed)"
+SEED="$(abspath "$SEED")" || die "Seed dir not found: $SEED"
+TMPROOT="${TMPDIR:-/tmp}"
+
+# compute relative start path inside seed (if ORIG_PWD is under SEED)
+REL=""
+case "$ORIG_PWD" in
+  "$SEED") REL="";;
+  "$SEED"/*) REL="${ORIG_PWD#"$SEED"/}";;
+  *) REL="";;
+esac
+
+# unique name + session dir
+if [[ -z "$NAME" ]]; then
+  for _ in 1 2 3 4 5; do
+    NAME="$(gen_name)"; SESSION_DIR="$TMPROOT/ovl-$NAME"
+    [[ ! -e "$SESSION_DIR" ]] && break || NAME=""
+  done
+  [[ -n "$NAME" ]] || die "Could not generate unique name in $TMPROOT."
+else
+  SESSION_DIR="$TMPROOT/ovl-$NAME"; [[ ! -e "$SESSION_DIR" ]] || die "Session exists: $SESSION_DIR"
+fi
+mkdir -p "$SESSION_DIR"
+
+mounted=false
+cleanup(){
+  set +e
+  # make sure we're not inside the mount before unmount/delete
+  cd "$ORIG_PWD" 2>/dev/null || cd / || true
+
+  if $mounted && [[ "$OS" == "Linux" ]]; then
+    if mountpoint -q "$MERGED"; then
+      umount "$MERGED" 2>/dev/null || true
+    fi
+  fi
+  echo
+  read -r -p "Delete session dir $SESSION_DIR ? [y/N] " ans
+  case "${ans,,}" in
+    y|yes) rm -rf "$SESSION_DIR"; echo "Deleted.";;
+    *) echo "Left in place: $SESSION_DIR";;
+  esac
+}
+trap cleanup EXIT INT TERM
+
+echo "Session: $NAME"
+echo "Seed:    $SEED"
+echo "Root:    $SESSION_DIR"
+
+if [[ "$OS" == "Linux" ]]; then
+  UPPER="$SESSION_DIR/upper"; WORK="$SESSION_DIR/work"; MERGED="$SESSION_DIR/merged"
+  mkdir -p "$UPPER" "$WORK" "$MERGED"
+
+  FUSE_BIN="$(command -v fuse-overlayfs || true)"
+  KERNEL_OVERLAY_OK=false; grep -qE '(^|[[:space:]])overlay$' /proc/filesystems && KERNEL_OVERLAY_OK=true
+
+  if [[ -n "$FUSE_BIN" ]]; then
+    MOUNT_METHOD="fuse"
+    "$FUSE_BIN" -o "lowerdir=$SEED,upperdir=$UPPER,workdir=$WORK" "$MERGED"
+  elif [[ "$EUID" -eq 0 && "$KERNEL_OVERLAY_OK" == "true" ]]; then
+    MOUNT_METHOD="kernel"
+    mount -t overlay overlay -o "lowerdir=$SEED,upperdir=$UPPER,workdir=$WORK" "$MERGED"
+  else
+    die "fuse-overlayfs not found and kernel overlay unavailable. Install: sudo apt install -y fuse-overlayfs"
+  fi
+  mounted=true
+  WORKDIR="$MERGED"
+
+elif [[ "$OS" == "Darwin" ]]; then
+  MERGED="$SESSION_DIR/merged"
+  /bin/cp -c -R "$SEED" "$MERGED" 2>/dev/null || /bin/cp -R "$SEED" "$MERGED"
+  WORKDIR="$MERGED"
+else
+  die "Unsupported OS: $OS"
+fi
+
+# compute starting directory inside the workspace (same relative subpath)
+STARTDIR="$WORKDIR"
+if [[ -n "$REL" && -d "$WORKDIR/$REL" ]]; then
+  STARTDIR="$WORKDIR/$REL"
+fi
+
+# Pick user shell
+USER_SHELL="${SHELL:-/bin/bash}"
+[[ -x "$USER_SHELL" ]] || USER_SHELL="/bin/bash"
+[[ -x "$USER_SHELL" ]] || USER_SHELL="/bin/sh"
+
+export OVL_NAME="$NAME" OVL_SEED="$SEED" OVL_SESSION="$SESSION_DIR" OVL_WORKDIR="$WORKDIR"
+
+echo
+if [[ -n "$CMD" ]]; then
+  # Parent stays in ORIG_PWD; command runs in subshell at STARTDIR
+  ( cd "$STARTDIR" && exec "$USER_SHELL" -lc "$CMD" )
+else
+  echo "Entering $USER_SHELL at $STARTDIR; changes are private to this session."
+  # Run interactive shell in a subshell so parent CWD doesn’t change; traps will fire cleanly
+  (
+    cd "$STARTDIR"
+    case "$(basename "$USER_SHELL")" in
+      zsh) "$USER_SHELL" -l -i ;;
+      bash) "$USER_SHELL" --login -i ;;
+      *) "$USER_SHELL" ;;
+    esac
+  )
+fi
