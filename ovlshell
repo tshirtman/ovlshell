@@ -1,38 +1,39 @@
 #!/usr/bin/env bash
 # ovlshell.sh — private workspace from git root or $PWD.
-# Linux: fuse-overlayfs (or kernel overlay). macOS: APFS clone (cp -c -R).
+# Linux: fuse-overlayfs (or kernel overlay). macOS: unionfs-fuse (fast) -> APFS clone fallback.
 set -Eeuo pipefail
 
 die(){ echo "Error: $*" >&2; exit 1; }
+warn(){ echo "Note: $*" >&2; }
+info(){ echo "$*" >&1; }
 
 abspath(){ (cd "$1" 2>/dev/null && pwd -P) || { local d="$(dirname "$1")"; local b="$(basename "$1")"; (cd "$d" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$b"); }; }
-
-pick_seed(){
-  if r="$(git rev-parse --show-toplevel 2>/dev/null)"; then printf '%s\n' "$r"; else printf '%s\n' "$PWD"; fi
-}
-
-gen_name(){
-  local -a ADJ=(admiring adoring brave clever focused gifted goofy happy hopeful keen lucid mystic nifty nimble quirky serene sharp stoic sunny zealous)
-  local -a N=(archimedes bohr curie darwin euclid fermi gauss hamilton kepler lovelace maxwell newton pascal riemann turing volta wright)
-  printf '%s_%s\n' "${ADJ[$RANDOM%${#ADJ[@]}]}" "${N[$RANDOM%${#N[@]}]}"
-}
+pick_seed(){ if r="$(git rev-parse --show-toplevel 2>/dev/null)"; then printf '%s\n' "$r"; else printf '%s\n' "$PWD"; fi; }
+gen_name(){ local -a ADJ=(admiring adoring brave clever focused gifted goofy happy hopeful keen lucid mystic nifty nimble quirky serene sharp stoic sunny zealous); local -a N=(archimedes bohr curie darwin euclid fermi gauss hamilton kepler lovelace maxwell newton pascal riemann turing volta wright); printf '%s_%s\n' "${ADJ[$RANDOM%${#ADJ[@]}]}" "${N[$RANDOM%${#N[@]}]}"; }
 
 usage(){
   cat <<EOF
-Usage: $0 [-n name] [-c "command"]
+Usage: $0 [--setup] [--yes|-y] [--keep] [-n name] [-c "command"]
+  --setup     Check & install optional deps for fast mode (macOS: macFUSE+unionfs; Linux: fuse-overlayfs)
+  --yes, -y   Assume "yes" for --setup confirmations (non-interactive)
+  --keep      Skip cleanup prompt and keep the session directory
   -n name     Optional session name (default: docker-style random)
   -c command  Run non-interactive command in the workspace then exit
 Behavior:
   * Seed = git repo root if inside a repo, else current directory
-  * Creates a private workspace under \$TMPDIR (or /tmp)
-  * Linux: overlay COW; macOS: APFS clone
+  * Linux: prefer fuse-overlayfs (rootless); fallback kernel overlay (root)
+  * macOS: prefer unionfs-fuse (via macFUSE); fallback APFS clone (cp -c -R)
   * Launches your shell from \$SHELL (fallback: /bin/bash, then /bin/sh)
 EOF
 }
 
-NAME=""; CMD=""
+OS="$(uname -s)"
+NAME=""; CMD=""; DO_SETUP=false; ASSUME_YES=false; KEEP=false
 while [[ $# -gt 0 ]]; do
   case "${1:-}" in
+    --setup) DO_SETUP=true; shift ;;
+    --yes|-y) ASSUME_YES=true; shift ;;
+    --keep) KEEP=true; shift ;;
     -n) NAME="${2:-}"; shift 2 ;;
     -c) CMD="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -40,13 +41,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-OS="$(uname -s)"
 ORIG_PWD="$(pwd -P)"
-SEED="$(pick_seed)"
-SEED="$(abspath "$SEED")" || die "Seed dir not found: $SEED"
+SEED="$(pick_seed)"; SEED="$(abspath "$SEED")" || die "Seed dir not found: $SEED"
 TMPROOT="${TMPDIR:-/tmp}"
 
-# compute relative start path inside seed (if ORIG_PWD is under SEED)
 REL=""
 case "$ORIG_PWD" in
   "$SEED") REL="";;
@@ -54,35 +52,139 @@ case "$ORIG_PWD" in
   *) REL="";;
 esac
 
-# unique name + session dir
+ask(){
+  # ask "Question?" -> 0 if yes, 1 otherwise; respects --yes
+  local q="$1"
+  if $ASSUME_YES; then return 0; fi
+  read -r -p "$q [y/N] " ans
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+}
+
+capability_summary(){
+  echo "=== Capability Summary ==="
+  if [[ "$OS" == "Linux" ]]; then
+    local fusebin; fusebin="$(command -v fuse-overlayfs || true)"
+    local has_kernel=false; grep -qE '(^|[[:space:]])overlay$' /proc/filesystems && has_kernel=true
+    echo "OS: Linux"
+    echo "Preferred: fuse-overlayfs -> $( [[ -n "$fusebin" ]] && echo "available at $fusebin" || echo "MISSING" )"
+    echo "Fallback : kernel overlay  -> $( $has_kernel && echo "supported by kernel" || echo "MISSING" ) (requires root)"
+    [[ -z "$fusebin" ]] && warn "Install fuse-overlayfs for rootless speed. Run: $0 --setup"
+  elif [[ "$OS" == "Darwin" ]]; then
+    local has_union; command -v unionfs >/dev/null 2>&1 && has_union=true || has_union=false
+    echo "OS: macOS"
+    echo "Preferred: unionfs-fuse  -> $([[ "$has_union" == true ]] && echo "available" || echo "MISSING")"
+    echo "Fallback : APFS clone    -> available"
+    [[ "$has_union" == false ]] && warn "Install macFUSE + unionfs for instant mounts. Run: $0 --setup"
+  else
+    echo "OS: $OS (unsupported by this script)"
+  fi
+  echo "=========================="
+}
+
+maybe_setup(){
+  capability_summary
+
+  echo
+  echo "=== Setup ==="
+  if [[ "$OS" == "Linux" ]]; then
+    if command -v apt-get >/dev/null 2>&1; then
+      echo "Will install: fuse-overlayfs (APT)"
+      ask "Proceed with installation?" || { echo "Aborted."; exit 1; }
+      sudo apt-get update && sudo apt-get install -y fuse-overlayfs || die "APT install failed"
+      echo "OK."
+    elif command -v dnf >/dev/null 2>&1; then
+      echo "Will install: fuse-overlayfs (DNF)"
+      ask "Proceed with installation?" || { echo "Aborted."; exit 1; }
+      sudo dnf install -y fuse-overlayfs || die "DNF install failed"
+    elif command -v yum >/dev/null 2>&1; then
+      echo "Will install: fuse-overlayfs (Yum)"
+      ask "Proceed with installation?" || { echo "Aborted."; exit 1; }
+      sudo yum install -y fuse-overlayfs || die "Yum install failed"
+    elif command -v pacman >/dev/null 2>&1; then
+      echo "Will install: fuse-overlayfs (Pacman)"
+      ask "Proceed with installation?" || { echo "Aborted."; exit 1; }
+      sudo pacman -S --noconfirm fuse-overlayfs || die "Pacman install failed"
+    elif command -v zypper >/dev/null 2>&1; then
+      echo "Will install: fuse-overlayfs (Zypper)"
+      ask "Proceed with installation?" || { echo "Aborted."; exit 1; }
+      sudo zypper install -y fuse-overlayfs || die "Zypper install failed"
+    else
+      warn "No known package manager detected."
+      echo "Please install: fuse-overlayfs"
+      echo "Examples:"
+      echo "  Fedora:  sudo dnf install fuse-overlayfs"
+      echo "  Debian:  sudo apt-get install fuse-overlayfs"
+      echo "  Arch:    sudo pacman -S fuse-overlayfs"
+      echo "  openSUSE:sudo zypper install fuse-overlayfs"
+      exit 1
+    fi
+  elif [[ "$OS" == "Darwin" ]]; then
+    echo "On macOS, you'll need macFUSE for any unionfs functionality."
+    if ! command -v brew >/dev/null 2>&1; then
+      warn "Homebrew not found. Install it from https://brew.sh and rerun with --setup"
+      exit 1
+    fi
+
+    echo "Will install: macFUSE (cask)"
+    ask "Proceed with installation of macFUSE?" || { echo "Aborted."; exit 1; }
+    brew install --cask macfuse || die "macFUSE install failed"
+    echo "macFUSE installed. You may need to approve it in System Settings → Privacy & Security and reboot."
+
+    warn "Formulae for unionfs are no longer in Homebrew core due to licensing changes."
+    warn "To install unionfs-fuse, use a third-party tap, for example:"
+    info "  brew tap gromgit/fuse"
+    info "  brew install unionfs-fuse"
+    info "Or build it manually from source (see https://github.com/rpodgorny/unionfs-fuse)"
+    echo "Installation complete."
+  else
+    die "Unsupported OS for setup: $OS"
+  fi
+  echo "=== Setup complete ==="
+  capability_summary
+}
+
+# Only run setup if requested
+[[ "$DO_SETUP" == true ]] && maybe_setup
+
+# Initialize variables for cleanup function
+SESSION_DIR=""
+mounted=false
+
+# create unique session dir
 if [[ -z "$NAME" ]]; then
-  for _ in 1 2 3 4 5; do
-    NAME="$(gen_name)"; SESSION_DIR="$TMPROOT/ovl-$NAME"
-    [[ ! -e "$SESSION_DIR" ]] && break || NAME=""
+  for _ in 1 2 3 4 5; do 
+    NAME="$(gen_name)"
+    SESSION_DIR="$TMPROOT/ovl-$NAME"
+    [[ ! -e "$SESSION_DIR" ]] && break
+    NAME=""
   done
   [[ -n "$NAME" ]] || die "Could not generate unique name in $TMPROOT."
 else
-  SESSION_DIR="$TMPROOT/ovl-$NAME"; [[ ! -e "$SESSION_DIR" ]] || die "Session exists: $SESSION_DIR"
+  SESSION_DIR="$TMPROOT/ovl-$NAME"
+  [[ ! -e "$SESSION_DIR" ]] || die "Session exists: $SESSION_DIR"
 fi
 mkdir -p "$SESSION_DIR"
 
-mounted=false
 cleanup(){
   set +e
-  # make sure we're not inside the mount before unmount/delete
   cd "$ORIG_PWD" 2>/dev/null || cd / || true
-
   if $mounted && [[ "$OS" == "Linux" ]]; then
-    if mountpoint -q "$MERGED"; then
-      umount "$MERGED" 2>/dev/null || true
-    fi
+    if mountpoint -q "$MERGED"; then umount "$MERGED" 2>/dev/null || true; fi
+  elif $mounted && [[ "$OS" == "Darwin" && "$MOUNT_METHOD" == "unionfs-fuse" ]]; then
+    umount "$MERGED" 2>/dev/null || true
   fi
   echo
-  read -r -p "Delete session dir $SESSION_DIR ? [y/N] " ans
-  case "${ans,,}" in
-    y|yes) rm -rf "$SESSION_DIR"; echo "Deleted.";;
-    *) echo "Left in place: $SESSION_DIR";;
-  esac
+  if [[ -n "$SESSION_DIR" ]]; then
+    if $KEEP; then
+      echo "Keeping session dir (requested): $SESSION_DIR"
+    else
+      read -r -p "Delete session dir $SESSION_DIR ? [y/N] " ans
+      case "${ans,,}" in
+        y|yes) rm -rf "$SESSION_DIR"; echo "Deleted.";;
+        *) echo "Left in place: $SESSION_DIR";;
+      esac
+    fi
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -90,53 +192,65 @@ echo "Session: $NAME"
 echo "Seed:    $SEED"
 echo "Root:    $SESSION_DIR"
 
+# mount workspace
 if [[ "$OS" == "Linux" ]]; then
   UPPER="$SESSION_DIR/upper"; WORK="$SESSION_DIR/work"; MERGED="$SESSION_DIR/merged"
   mkdir -p "$UPPER" "$WORK" "$MERGED"
-
   FUSE_BIN="$(command -v fuse-overlayfs || true)"
   KERNEL_OVERLAY_OK=false; grep -qE '(^|[[:space:]])overlay$' /proc/filesystems && KERNEL_OVERLAY_OK=true
-
   if [[ -n "$FUSE_BIN" ]]; then
-    MOUNT_METHOD="fuse"
-    "$FUSE_BIN" -o "lowerdir=$SEED,upperdir=$UPPER,workdir=$WORK" "$MERGED"
+    MOUNT_METHOD="fuse"; "$FUSE_BIN" -o "lowerdir=$SEED,upperdir=$UPPER,workdir=$WORK" "$MERGED"
   elif [[ "$EUID" -eq 0 && "$KERNEL_OVERLAY_OK" == "true" ]]; then
-    MOUNT_METHOD="kernel"
-    mount -t overlay overlay -o "lowerdir=$SEED,upperdir=$UPPER,workdir=$WORK" "$MERGED"
+    MOUNT_METHOD="kernel"; mount -t overlay overlay -o "lowerdir=$SEED,upperdir=$UPPER,workdir=$WORK" "$MERGED"
   else
-    die "fuse-overlayfs not found and kernel overlay unavailable. Install: sudo apt install -y fuse-overlayfs"
+    die "Preferred method missing (fuse-overlayfs), and kernel overlay not available for current user. Run: $0 --setup"
   fi
-  mounted=true
-  WORKDIR="$MERGED"
+  mounted=true; WORKDIR="$MERGED"
 
 elif [[ "$OS" == "Darwin" ]]; then
   MERGED="$SESSION_DIR/merged"
-  /bin/cp -c -R "$SEED" "$MERGED" 2>/dev/null || /bin/cp -R "$SEED" "$MERGED"
-  WORKDIR="$MERGED"
+  mkdir -p "$MERGED"
+  if command -v unionfs >/dev/null 2>&1; then
+    # use unionfs-fuse if installed from a tap
+    UPPER="$SESSION_DIR/upper"
+    mkdir -p "$UPPER"
+    unionfs -o cow,auto_unmount "$UPPER"=RW:"$SEED"=RO "$MERGED"
+    MOUNT_METHOD="unionfs-fuse"
+    mounted=true
+    WORKDIR="$MERGED"
+  else
+    # Use hardlink-based overlay for cheap copy-on-write behavior
+    UPPER="$SESSION_DIR/upper"
+    mkdir -p "$UPPER"
+    
+    # Use cp with hardlinks for fast copy-on-write
+    cp -al "$SEED/." "$MERGED/" 2>/dev/null || {
+      # Fallback: manual hardlink creation
+      find "$SEED" -type d -exec mkdir -p "$MERGED/{}" \; 2>/dev/null || true
+      find "$SEED" -type f -exec sh -c 'ln "$1" "$2" 2>/dev/null || cp "$1" "$2"' _ {} "$MERGED/{}" \; 2>/dev/null || true
+    }
+    
+    MOUNT_METHOD="hardlink-cow"
+    WORKDIR="$MERGED"
+    info "Using hardlink-based copy-on-write (fast, but files share inodes until modified)."
+  fi
 else
   die "Unsupported OS: $OS"
 fi
 
-# compute starting directory inside the workspace (same relative subpath)
-STARTDIR="$WORKDIR"
-if [[ -n "$REL" && -d "$WORKDIR/$REL" ]]; then
-  STARTDIR="$WORKDIR/$REL"
-fi
+# start path (same relative subdir)
+STARTDIR="$WORKDIR"; if [[ -n "$REL" && -d "$WORKDIR/$REL" ]]; then STARTDIR="$WORKDIR/$REL"; fi
 
-# Pick user shell
-USER_SHELL="${SHELL:-/bin/bash}"
-[[ -x "$USER_SHELL" ]] || USER_SHELL="/bin/bash"
-[[ -x "$USER_SHELL" ]] || USER_SHELL="/bin/sh"
-
-export OVL_NAME="$NAME" OVL_SEED="$SEED" OVL_SESSION="$SESSION_DIR" OVL_WORKDIR="$WORKDIR"
+# shell
+USER_SHELL="${SHELL:-/bin/bash}"; [[ -x "$USER_SHELL" ]] || USER_SHELL="/bin/bash"; [[ -x "$USER_SHELL" ]] || USER_SHELL="/bin/sh"
+export OVL_NAME="$NAME" OVL_SEED="$SEED" OVL_SESSION="$SESSION_DIR" OVL_WORKDIR="$WORKDIR" OVL_METHOD="${MOUNT_METHOD:-unknown}"
 
 echo
 if [[ -n "$CMD" ]]; then
-  # Parent stays in ORIG_PWD; command runs in subshell at STARTDIR
   ( cd "$STARTDIR" && exec "$USER_SHELL" -lc "$CMD" )
 else
+  echo "Mode: ${MOUNT_METHOD:-unknown}"
   echo "Entering $USER_SHELL at $STARTDIR; changes are private to this session."
-  # Run interactive shell in a subshell so parent CWD doesn’t change; traps will fire cleanly
   (
     cd "$STARTDIR"
     case "$(basename "$USER_SHELL")" in
