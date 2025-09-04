@@ -12,8 +12,9 @@ When you exit, you can choose to keep or delete the temporary workspace.
 - **Private changes**: start from a common seed, all edits go into an isolated layer.
 - **Git-aware**: if you are inside a Git repo, the repo root is used as the seed; otherwise it uses the current directory.
 - **Cross-platform**:  
-  - **Linux**: uses [`fuse-overlayfs`](https://github.com/containers/fuse-overlayfs) (rootless) or kernel OverlayFS (if root).  
-  - **macOS**: uses unionfs-fuse (fast) or hardlink-based copy-on-write (instant, fallback).
+  - **Git repositories**: uses `git worktree` for instant workspace creation (~0.1s regardless of repo size)
+  - **Linux non-git**: uses [`fuse-overlayfs`](https://github.com/containers/fuse-overlayfs) (rootless) or kernel OverlayFS (if root)
+  - **macOS non-git**: uses hardlink-based copy-on-write (fast, enterprise-safe)
 - **Shell integration**: starts `$SHELL` (fallbacks: `/bin/bash`, `/bin/sh`), passing through your environment.
 - **Consistent paths**: if you start from a subdirectory of the seed, you land in the equivalent subdirectory inside the workspace.
 - **Cleanup prompt**: after exit, you can confirm whether to delete or keep the workspace for inspection.
@@ -31,33 +32,24 @@ chmod +x ~/bin/ovlshell
 
 ### Dependencies
 
-#### Linux: fuse-overlayfs
+#### Git repositories (Linux & macOS)
 
-(recommended, works rootless).
-On Ubuntu/Debian:
+No extra dependencies required. Uses `git worktree` for instant workspace creation (~0.1s regardless of repository size).
 
-```
-sudo apt install -y fuse-overlayfs
+#### Linux non-git directories
+
+Install `fuse-overlayfs` (recommended, works rootless):
+
+```bash
+sudo apt install -y fuse-overlayfs  # Ubuntu/Debian
+sudo dnf install -y fuse-overlayfs  # Fedora
 ```
 
 Or run as root with kernel OverlayFS enabled.
 
-#### macOS
+#### macOS non-git directories
 
-APFS filesystem (default on modern macOS). No extra packages required for basic functionality.
-
-For optimal performance, install unionfs-fuse:
-
-```bash
-# Install macFUSE first
-brew install --cask macfuse
-
-# Install unionfs-fuse from third-party tap
-brew tap gromgit/fuse
-brew install unionfs-fuse
-```
-
-Without unionfs-fuse, ovlshell uses a hardlink-based copy-on-write system that's nearly instant and provides true CoW semantics.
+APFS filesystem (default on modern macOS). Uses hardlink-based copy-on-write for fast setup. No extra packages required and enterprise-safe (no kernel extensions).
 
 
 ## Usage
@@ -100,24 +92,29 @@ Inspect changes
 
 If you choose not to delete, you can inspect what changed:
 
-- **Linux**: look in upper/ inside the session dir.
-- **macOS with unionfs-fuse**: look in upper/ inside the session dir.
-- **macOS hardlink fallback**: modified files break hardlinks and exist in merged/.
+- **Git worktree (Linux & macOS)**: changes are tracked by git in the worktree.
+- **Linux overlay**: look in upper/ inside the session dir.
+- **macOS hardlink**: modified files break hardlinks and exist in merged/.
 
 Session layout
 
-**Linux & macOS with unionfs-fuse:**
+**Git worktree (Linux & macOS):**
+```
+/tmp/ovl-brave_curie/
+└── merged/   # git worktree checkout (instant)
+```
+
+**Linux overlay:**
 ```
 /tmp/ovl-brave_curie/
 ├── upper/    # private changes
-├── work/     # overlay bookkeeping (Linux only)
+├── work/     # overlay bookkeeping
 └── merged/   # union view (your shell runs here)
 ```
 
-**macOS hardlink fallback:**
+**macOS hardlink:**
 ```
 /tmp/ovl-brave_curie/
-├── upper/    # (unused in hardlink mode)
 └── merged/   # hardlinked files + modifications
 ```
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ovlshell.sh — private workspace from git root or $PWD.
-# Linux: fuse-overlayfs (or kernel overlay). macOS: unionfs-fuse (fast) -> APFS clone fallback.
+# Cross-platform: git worktree (instant). Linux: fuse-overlayfs (or kernel overlay). macOS: hardlink CoW.
 set -Eeuo pipefail
 
 die(){ echo "Error: $*" >&2; exit 1; }
@@ -14,15 +14,16 @@ gen_name(){ local -a ADJ=(admiring adoring brave clever focused gifted goofy hap
 usage(){
   cat <<EOF
 Usage: $0 [--setup] [--yes|-y] [--keep] [-n name] [-c "command"]
-  --setup     Check & install optional deps for fast mode (macOS: macFUSE+unionfs; Linux: fuse-overlayfs)
+  --setup     Check & install optional deps for non-git directories (Linux: fuse-overlayfs)
   --yes, -y   Assume "yes" for --setup confirmations (non-interactive)
   --keep      Skip cleanup prompt and keep the session directory
   -n name     Optional session name (default: docker-style random)
   -c command  Run non-interactive command in the workspace then exit
 Behavior:
   * Seed = git repo root if inside a repo, else current directory
-  * Linux: prefer fuse-overlayfs (rootless); fallback kernel overlay (root)
-  * macOS: prefer unionfs-fuse (via macFUSE); fallback APFS clone (cp -c -R)
+  * Git repos: instant workspace using git worktree (cross-platform)
+  * Linux non-git: fuse-overlayfs (rootless) or kernel overlay (root)
+  * macOS non-git: hardlink-based copy-on-write (enterprise-safe)
   * Launches your shell from \$SHELL (fallback: /bin/bash, then /bin/sh)
 EOF
 }
@@ -66,15 +67,14 @@ capability_summary(){
     local fusebin; fusebin="$(command -v fuse-overlayfs || true)"
     local has_kernel=false; grep -qE '(^|[[:space:]])overlay$' /proc/filesystems && has_kernel=true
     echo "OS: Linux"
-    echo "Preferred: fuse-overlayfs -> $( [[ -n "$fusebin" ]] && echo "available at $fusebin" || echo "MISSING" )"
-    echo "Fallback : kernel overlay  -> $( $has_kernel && echo "supported by kernel" || echo "MISSING" ) (requires root)"
-    [[ -z "$fusebin" ]] && warn "Install fuse-overlayfs for rootless speed. Run: $0 --setup"
+    echo "Git repos: git worktree   -> available (instant)"
+    echo "Non-git  : fuse-overlayfs -> $( [[ -n "$fusebin" ]] && echo "available at $fusebin" || echo "MISSING" )"
+    echo "Fallback : kernel overlay -> $( $has_kernel && echo "supported by kernel" || echo "MISSING" ) (requires root)"
+    [[ -z "$fusebin" ]] && warn "Install fuse-overlayfs for non-git directories. Run: $0 --setup"
   elif [[ "$OS" == "Darwin" ]]; then
-    local has_union; command -v unionfs >/dev/null 2>&1 && has_union=true || has_union=false
     echo "OS: macOS"
-    echo "Preferred: unionfs-fuse  -> $([[ "$has_union" == true ]] && echo "available" || echo "MISSING")"
-    echo "Fallback : APFS clone    -> available"
-    [[ "$has_union" == false ]] && warn "Install macFUSE + unionfs for instant mounts. Run: $0 --setup"
+    echo "Git repos: git worktree   -> available (instant)"
+    echo "Non-git  : hardlink CoW   -> available (fast, enterprise-safe)"
   else
     echo "OS: $OS (unsupported by this script)"
   fi
@@ -119,23 +119,8 @@ maybe_setup(){
       exit 1
     fi
   elif [[ "$OS" == "Darwin" ]]; then
-    echo "On macOS, you'll need macFUSE for any unionfs functionality."
-    if ! command -v brew >/dev/null 2>&1; then
-      warn "Homebrew not found. Install it from https://brew.sh and rerun with --setup"
-      exit 1
-    fi
-
-    echo "Will install: macFUSE (cask)"
-    ask "Proceed with installation of macFUSE?" || { echo "Aborted."; exit 1; }
-    brew install --cask macfuse || die "macFUSE install failed"
-    echo "macFUSE installed. You may need to approve it in System Settings → Privacy & Security and reboot."
-
-    warn "Formulae for unionfs are no longer in Homebrew core due to licensing changes."
-    warn "To install unionfs-fuse, use a third-party tap, for example:"
-    info "  brew tap gromgit/fuse"
-    info "  brew install unionfs-fuse"
-    info "Or build it manually from source (see https://github.com/rpodgorny/unionfs-fuse)"
-    echo "Installation complete."
+    echo "macOS uses git worktree (instant) for git repos and hardlink CoW for non-git directories."
+    echo "No additional setup required - both methods are built into the system."
   else
     die "Unsupported OS for setup: $OS"
   fi
@@ -170,19 +155,29 @@ cleanup(){
   cd "$ORIG_PWD" 2>/dev/null || cd / || true
   if $mounted && [[ "$OS" == "Linux" ]]; then
     if mountpoint -q "$MERGED"; then umount "$MERGED" 2>/dev/null || true; fi
-  elif $mounted && [[ "$OS" == "Darwin" && "$MOUNT_METHOD" == "unionfs-fuse" ]]; then
-    umount "$MERGED" 2>/dev/null || true
   fi
+  
+  # Clean up git worktree if used (works on both Linux and macOS)
+  if [[ "${MOUNT_METHOD:-}" == "git-worktree" && -n "${MERGED:-}" ]]; then
+    git -C "$SEED" worktree remove "$MERGED" --force 2>/dev/null || true
+  fi
+  
   echo
   if [[ -n "$SESSION_DIR" ]]; then
     if $KEEP; then
       echo "Keeping session dir (requested): $SESSION_DIR"
     else
-      read -r -p "Delete session dir $SESSION_DIR ? [y/N] " ans
-      case "${ans,,}" in
-        y|yes) rm -rf "$SESSION_DIR"; echo "Deleted.";;
-        *) echo "Left in place: $SESSION_DIR";;
-      esac
+      if [[ "${MOUNT_METHOD:-}" == "git-worktree" ]]; then
+        echo "Git worktree cleaned up."
+        rm -rf "$SESSION_DIR" 2>/dev/null || true
+        echo "Session directory deleted."
+      else
+        read -r -p "Delete session dir $SESSION_DIR ? [y/N] " ans
+        case "${ans,,}" in
+          y|yes) rm -rf "$SESSION_DIR"; echo "Deleted.";;
+          *) echo "Left in place: $SESSION_DIR";;
+        esac
+      fi
     fi
   fi
 }
@@ -194,45 +189,83 @@ echo "Root:    $SESSION_DIR"
 
 # mount workspace
 if [[ "$OS" == "Linux" ]]; then
-  UPPER="$SESSION_DIR/upper"; WORK="$SESSION_DIR/work"; MERGED="$SESSION_DIR/merged"
-  mkdir -p "$UPPER" "$WORK" "$MERGED"
-  FUSE_BIN="$(command -v fuse-overlayfs || true)"
-  KERNEL_OVERLAY_OK=false; grep -qE '(^|[[:space:]])overlay$' /proc/filesystems && KERNEL_OVERLAY_OK=true
-  if [[ -n "$FUSE_BIN" ]]; then
-    MOUNT_METHOD="fuse"; "$FUSE_BIN" -o "lowerdir=$SEED,upperdir=$UPPER,workdir=$WORK" "$MERGED"
-  elif [[ "$EUID" -eq 0 && "$KERNEL_OVERLAY_OK" == "true" ]]; then
-    MOUNT_METHOD="kernel"; mount -t overlay overlay -o "lowerdir=$SEED,upperdir=$UPPER,workdir=$WORK" "$MERGED"
+  MERGED="$SESSION_DIR/merged"
+  
+  # Try git worktree first (fastest for git repos, cross-platform)
+  if [[ -d "$SEED/.git" ]] && git -C "$SEED" rev-parse --git-dir >/dev/null 2>&1; then
+    # Use git worktree for instant workspace creation
+    if git -C "$SEED" worktree add "$MERGED" HEAD 2>/dev/null; then
+      MOUNT_METHOD="git-worktree"
+      WORKDIR="$MERGED"
+      info "Using git worktree (instant, cross-platform)."
+    else
+      # Fallback to overlay if worktree fails
+      UPPER="$SESSION_DIR/upper"; WORK="$SESSION_DIR/work"
+      mkdir -p "$UPPER" "$WORK" "$MERGED"
+      FUSE_BIN="$(command -v fuse-overlayfs || true)"
+      KERNEL_OVERLAY_OK=false; grep -qE '(^|[[:space:]])overlay$' /proc/filesystems && KERNEL_OVERLAY_OK=true
+      if [[ -n "$FUSE_BIN" ]]; then
+        MOUNT_METHOD="fuse"; "$FUSE_BIN" -o "lowerdir=$SEED,upperdir=$UPPER,workdir=$WORK" "$MERGED"
+        mounted=true
+      elif [[ "$EUID" -eq 0 && "$KERNEL_OVERLAY_OK" == "true" ]]; then
+        MOUNT_METHOD="kernel"; mount -t overlay overlay -o "lowerdir=$SEED,upperdir=$UPPER,workdir=$WORK" "$MERGED"
+        mounted=true
+      else
+        die "Git worktree failed and overlay methods unavailable. Run: $0 --setup"
+      fi
+      WORKDIR="$MERGED"
+      info "Using overlay filesystem (git worktree failed, using fallback)."
+    fi
   else
-    die "Preferred method missing (fuse-overlayfs), and kernel overlay not available for current user. Run: $0 --setup"
+    # Non-git repo: use overlay filesystems
+    UPPER="$SESSION_DIR/upper"; WORK="$SESSION_DIR/work"
+    mkdir -p "$UPPER" "$WORK" "$MERGED"
+    FUSE_BIN="$(command -v fuse-overlayfs || true)"
+    KERNEL_OVERLAY_OK=false; grep -qE '(^|[[:space:]])overlay$' /proc/filesystems && KERNEL_OVERLAY_OK=true
+    if [[ -n "$FUSE_BIN" ]]; then
+      MOUNT_METHOD="fuse"; "$FUSE_BIN" -o "lowerdir=$SEED,upperdir=$UPPER,workdir=$WORK" "$MERGED"
+      mounted=true
+    elif [[ "$EUID" -eq 0 && "$KERNEL_OVERLAY_OK" == "true" ]]; then
+      MOUNT_METHOD="kernel"; mount -t overlay overlay -o "lowerdir=$SEED,upperdir=$UPPER,workdir=$WORK" "$MERGED"
+      mounted=true
+    else
+      die "Preferred method missing (fuse-overlayfs), and kernel overlay not available for current user. Run: $0 --setup"
+    fi
+    WORKDIR="$MERGED"
+    info "Using overlay filesystem (non-git repository)."
   fi
-  mounted=true; WORKDIR="$MERGED"
 
 elif [[ "$OS" == "Darwin" ]]; then
   MERGED="$SESSION_DIR/merged"
-  mkdir -p "$MERGED"
-  if command -v unionfs >/dev/null 2>&1; then
-    # use unionfs-fuse if installed from a tap
-    UPPER="$SESSION_DIR/upper"
-    mkdir -p "$UPPER"
-    unionfs -o cow,auto_unmount "$UPPER"=RW:"$SEED"=RO "$MERGED"
-    MOUNT_METHOD="unionfs-fuse"
-    mounted=true
-    WORKDIR="$MERGED"
+  
+  # Try git worktree first (fastest for git repos, enterprise-safe)
+  if [[ -d "$SEED/.git" ]] && git -C "$SEED" rev-parse --git-dir >/dev/null 2>&1; then
+    # Use git worktree for instant workspace creation
+    if git -C "$SEED" worktree add "$MERGED" HEAD 2>/dev/null; then
+      MOUNT_METHOD="git-worktree"
+      WORKDIR="$MERGED"
+      info "Using git worktree (instant, enterprise-safe)."
+    else
+      # Fallback if worktree fails (e.g., dirty state)
+      mkdir -p "$MERGED"
+      cp -al "$SEED/." "$MERGED/" 2>/dev/null || {
+        find "$SEED" -type d -exec mkdir -p "$MERGED/{}" \; 2>/dev/null || true
+        find "$SEED" -type f -exec sh -c 'ln "$1" "$2" 2>/dev/null || cp "$1" "$2"' _ {} "$MERGED/{}" \; 2>/dev/null || true
+      }
+      MOUNT_METHOD="hardlink-cow"
+      WORKDIR="$MERGED"
+      info "Using hardlink-based copy-on-write (git worktree failed, using fallback)."
+    fi
   else
-    # Use hardlink-based overlay for cheap copy-on-write behavior
-    UPPER="$SESSION_DIR/upper"
-    mkdir -p "$UPPER"
-    
-    # Use cp with hardlinks for fast copy-on-write
+    # Non-git repo: use hardlinks
+    mkdir -p "$MERGED"
     cp -al "$SEED/." "$MERGED/" 2>/dev/null || {
-      # Fallback: manual hardlink creation
       find "$SEED" -type d -exec mkdir -p "$MERGED/{}" \; 2>/dev/null || true
       find "$SEED" -type f -exec sh -c 'ln "$1" "$2" 2>/dev/null || cp "$1" "$2"' _ {} "$MERGED/{}" \; 2>/dev/null || true
     }
-    
     MOUNT_METHOD="hardlink-cow"
     WORKDIR="$MERGED"
-    info "Using hardlink-based copy-on-write (fast, but files share inodes until modified)."
+    info "Using hardlink-based copy-on-write (non-git repository)."
   fi
 else
   die "Unsupported OS: $OS"
